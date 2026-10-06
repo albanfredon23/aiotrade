@@ -22,8 +22,44 @@ cd aiotrade
 docker compose up --build
 ```
 
-Puis ouvrir <http://localhost:8088> (port modifiable : `AIOTRADE_PORT=9000 docker compose up --build`).
-La documentation interactive de l'API est servie sur <http://localhost:8088/api/docs>.
+Puis ouvrir <http://localhost> (ports modifiables : `AIOTRADE_HTTP_PORT=8088 docker compose up --build`).
+La documentation interactive de l'API est servie sur <http://localhost/api/docs>.
+
+## Architecture des conteneurs
+
+```text
+                 Internet
+                    │ 80 / 443
+          ┌─────────▼──────────┐   public-net
+          │   aiotrade-web     │   seul service exposé : site, tableau de bord, proxy /api
+          │   nginx, CSP       │   lit /srv/metrics en lecture seule (:ro)
+          └─────────┬──────────┘
+                    │ internal-net (internal: true : ni port publié, ni accès sortant)
+          ┌─────────▼──────────┐
+          │  aiotrade-engine   │   moteur Python en bytecode seul, utilisateur non root,
+          │  FastAPI           │   système de fichiers en lecture seule
+          └─────────┬──────────┘
+                    │ écrit engine.json et benchmark.json
+             [ volume metrics ] ◀── aiotrade-trader (profil « trading », réseau egress-net)
+```
+
+| Directive | Mise en œuvre |
+|---|---|
+| Microservices cloisonnés | `docker-compose.yml` : `aiotrade-engine` sur `internal-net` uniquement (aucun `ports`, réseau `internal: true`), `aiotrade-web` seul publié (80 → 8080, 443 → 8443) et relié aux deux réseaux |
+| Métriques partagées | Le moteur écrit `engine.json` et `benchmark.json` dans le volume `metrics` (écriture atomique) ; le site le monte en `:ro` et ne sert que ces fichiers sous `/metrics/` |
+| Bytecode seul | `engine/Dockerfile` multi-étapes : `python -m compileall -b .` puis `find . -name "*.py" -delete` ; l'image finale ne contient aucun `.py` du moteur, et les tests de l'étape `test` tournent sur ce bytecode |
+| Secrets | `.gitignore` et `.dockerignore` excluent `.env`, bases locales (`.sqlite`, `.db`), clés et certificats, registres ; seul `.env.example` (valeurs vides) est versionné |
+| HTTPS | Déposer `fullchain.pem` et `privkey.pem` dans `certs/` : HTTPS (HTTP/2) sur 443, redirection de 80 vers HTTPS et HSTS. Sans certificat, HTTP seul pour le développement |
+| Durcissement | Conteneurs en lecture seule, `cap_drop: ALL`, `no-new-privileges`, utilisateur non root pour le moteur |
+| Frictions dans le SCG | `engine/tests/test_scg_frictions.py` : un faisceau admis sans frictions est rejeté dès que le spread bid/ask et le slippage réels sont déduits ; le slippage seul suffit à le faire basculer ; le co-pilote transmet bien le spread coté au garde-fou |
+
+Limite à connaître : le bytecode Python se décompile avec des outils publics. Il dissuade la lecture
+occasionnelle du code mais ne constitue pas une protection absolue ; pour aller plus loin, compiler les
+modules sensibles en code natif (Cython ou Nuitka).
+
+L'exécutant de trading (`aiotrade-trader`, profil `trading`) a besoin d'un accès sortant pour joindre le
+courtier : il est placé sur son propre réseau `egress-net`, sans lien avec `internal-net`. Le moteur de l'API
+n'a jamais d'accès sortant.
 
 ## Le pipeline
 
@@ -112,7 +148,7 @@ jugés que sur données réelles, avec un modèle de prévision qui porte un vra
 cd engine
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest                                  # 112 tests (1 ignoré sans pandas)
+python -m pytest                                  # 121 tests (1 ignoré sans pandas)
 python -m aiotrade simulate --shock flash_crash --ledger
 python -m aiotrade benchmark --seeds 11 12 13 --out reports/benchmark.json
 python -m aiotrade ledger-verify ledger/decisions.jsonl
@@ -124,8 +160,10 @@ npm ci
 npm run dev
 ```
 
-Les tests s'exécutent aussi dans le conteneur : `docker build --target test engine`.
-La CI GitHub Actions (`.github/workflows/ci.yml`) lance les tests, le build du site et la stack Docker.
+Les tests s'exécutent aussi dans le conteneur, sur le bytecode seul : `docker build --target test engine`.
+La CI GitHub Actions (`.github/workflows/ci.yml`) lance les tests, le build du site, la stack Docker et
+vérifie le cloisonnement (aucun `.py` dans l'image, aucun port ni accès sortant pour le moteur, volume en
+lecture seule côté site).
 
 Kronos (optionnel) : `pip install -e ".[kronos]"` installe torch, pandas et huggingface_hub ; le dépôt Kronos
 doit être cloné et ajouté au `PYTHONPATH`. Sans lui, l'essaim d'agents est utilisé.
@@ -149,7 +187,7 @@ cp .env.example .env        # puis renseigner AIOTRADE_BINANCE_API_KEY et AIOTRA
 python -m aiotrade broker-check --symbol BTCUSDT
 python -m aiotrade trade --broker binance --symbol BTCUSDT --loop
 # ou en conteneur :
-docker compose --profile trading up -d trader
+docker compose --profile trading up -d aiotrade-trader
 ```
 
 Avec `AIOTRADE_SEND_ORDERS=0` (défaut), les ordres sont validés par Binance via `/api/v3/order/test` sans être
@@ -183,7 +221,7 @@ Sans ces deux variables, le connecteur refuse de s'adresser à l'API live.
 | Formulaire | Case de consentement non pré-cochée, mention d'information, validation serveur, limitation de débit, aucune donnée conservée dans cette démo |
 | SEO | Open Graph + image, JSON-LD (`Organization`, `WebSite`, `SoftwareApplication` avec offres, `FAQPage`), `robots.txt`, `sitemap.xml`, URL canoniques |
 | Analytics éthiques | Plausible / Matomo optionnel, chargé uniquement après consentement (`meta name="aiotrade:analytics-src"`) ; aucun appel tiers par défaut |
-| Sécurité | CSP stricte (`script-src 'self'`, `style-src 'self'`), `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy` ; API servie sur la même origine |
+| Sécurité | CSP stricte (`default-src 'self'`, `script-src 'self'`, `style-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`), `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`, HSTS en HTTPS ; API et métriques servies sur la même origine |
 | Conversion | CTA « Demander une démo » répétés, démo interactive à 4 bras avec registre en direct, résultats et limites, compatibilité des marchés, offres (SaaS, licence API / FIX, cession), indicateurs de confiance, FAQ |
 
 ## Avant la mise en ligne
@@ -192,7 +230,7 @@ Sans ces deux variables, le connecteur refuse de s'adresser à l'API live.
 - Compléter les champs surlignés `[…]` des pages légales (éditeur, hébergeur, contacts).
 - Remplacer les deux emplacements de témoignages par des témoignages réels et autorisés.
 - Brancher `POST /api/contact` sur votre CRM ou votre messagerie (la démo valide puis ignore la demande).
-- Servir le site en HTTPS et activer HSTS (`web/nginx/security-headers.conf`).
+- Déposer les certificats TLS dans `certs/` (HTTPS, redirection et HSTS s'activent seuls).
 - Pour activer la mesure d'audience, renseigner `aiotrade:analytics-src` et ajouter le domaine de l'outil à la CSP.
 - Remplacer `engine/data/macro_calendar.example.json` par un vrai calendrier économique.
 

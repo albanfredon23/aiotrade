@@ -26,6 +26,7 @@ from .integrity import IntegrityConfig, IntegrityFilter, ewma_volatility, micros
 from .ledger import XAILedger
 from .macro_gate import MacroCalendarGate, StaticCalendar
 from .market import MarketData
+from .metrics import MetricsPublisher
 from .sizing import SizingConfig
 
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
@@ -77,6 +78,7 @@ class LiveRunner:
         config: CopilotConfig | None = None,
         send_orders: bool = False,
         log: Callable[[str], None] = print,
+        metrics: MetricsPublisher | None = None,
     ) -> None:
         if interval not in INTERVAL_MINUTES:
             raise ValueError(f"intervalle non pris en charge : {interval}")
@@ -91,6 +93,7 @@ class LiveRunner:
         self.config = config or CopilotConfig()
         self.send_orders = send_orders
         self.log = log
+        self.metrics = metrics or MetricsPublisher("trader")
         self.rng = np.random.default_rng()
         self._peak = max((float(r.get("equity", 0.0)) for r in self.ledger.records()), default=0.0)
 
@@ -191,11 +194,18 @@ class LiveRunner:
                 # Panne réseau ou refus du courtier : aucune décision, nouvel essai à la
                 # prochaine clôture. Le stop déjà posé chez le courtier protège la position.
                 self.log(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} ERREUR courtier : {exc}")
+                self.metrics.update(status="error", error=str(exc)[:200])
             else:
                 rec = step.record
                 self.log(
                     f"{rec['timestamp_utc']} {rec['decision']:<5} alloc={rec['selected_allocation']:+.4f} "
                     f"d2={rec['market_integrity_d2']} gate={rec['macro_gate']} ordre={step.order}"
+                )
+                self.metrics.update(
+                    service="aiotrade-trader", status="ok", error=None, symbol=self.symbol,
+                    interval=self.interval, broker_mode=rec.get("broker_mode"), last_bar_utc=rec["timestamp_utc"],
+                    decision=rec["decision"], allocation=rec["selected_allocation"], equity=rec.get("equity"),
+                    integrity_status=rec["status"], macro_gate=rec["macro_gate"], ledger_records=rec.get("seq", 0) + 1,
                 )
             steps += 1
             if max_steps is not None and steps >= max_steps:

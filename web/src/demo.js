@@ -41,6 +41,7 @@ export function initDemo({ reducedMotion }) {
   const admOut = document.getElementById('demo-adm-out');
   const button = form.querySelector('button[type="submit"]');
 
+  const engineStatus = document.getElementById('engine-status');
   let data = null;
   let progress = 1;
   let controller = null;
@@ -233,6 +234,23 @@ export function initDemo({ reducedMotion }) {
     animate();
   }
 
+  // État du moteur, publié dans le volume de métriques partagé (servi en lecture seule par le site).
+  async function refreshEngineStatus() {
+    if (!engineStatus) return;
+    try {
+      const res = await fetch('/metrics/engine.json', { cache: 'no-store' });
+      if (!res.ok) return;
+      const m = await res.json();
+      const served = Number(m.simulations_served) || 0;
+      engineStatus.textContent =
+        `Moteur ${m.status === 'ok' ? 'en ligne' : 'indisponible'} · version ${m.version} · ` +
+        `${served.toLocaleString('fr-FR')} simulation${served > 1 ? 's' : ''} servie${served > 1 ? 's' : ''} depuis son démarrage`;
+      engineStatus.hidden = false;
+    } catch {
+      // Métriques absentes (serveur de développement) : rien à afficher.
+    }
+  }
+
   async function run() {
     controller?.abort();
     controller = new AbortController();
@@ -254,6 +272,7 @@ export function initDemo({ reducedMotion }) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       render(await res.json());
       status.textContent = 'Simulation terminée.';
+      refreshEngineStatus();
       track('demo_simulation', { shock: body.shock });
     } catch (error) {
       if (error.name === 'AbortError') return;

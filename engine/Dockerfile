@@ -1,5 +1,11 @@
-# Moteur AIOTrade (intégrité χ², Macro Gate, TAP, SCG, Kelly, XAI Ledger) : API FastAPI et exécutant de trading.
-FROM python:3.12-slim AS base
+# Moteur AIOTrade : API FastAPI et exécutant de trading.
+# Image de production sans code source : seul le bytecode Python (.pyc) est livré.
+#
+#   docker build --target test engine     tests lancés sur le bytecode, sans les sources
+#   docker build engine                   image d'exécution (cible par défaut)
+
+# --- Dépendances (communes à toutes les étapes) -----------------------------
+FROM python:3.12-slim AS deps
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -7,22 +13,39 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
-COPY aiotrade/ ./aiotrade/
-COPY data/ ./data/
-COPY reports/ ./reports/
 
-# Étape de test : docker build --target test ./engine
-FROM base AS test
+# --- Compilation : sources → bytecode, puis destruction des sources ---------
+FROM deps AS compile
+WORKDIR /build
+COPY aiotrade/ ./aiotrade/
+# -b : chaque module.py devient module.pyc à côté de lui (importable sans la source).
+RUN python -m compileall -b -q . \
+    && find . -name "*.py" -delete \
+    && find . -name "__pycache__" -type d -prune -exec rm -rf {} + \
+    && test -z "$(find . -name '*.py')"
+
+# --- Tests : exécutés contre le bytecode seul -------------------------------
+FROM deps AS test
 COPY requirements-dev.txt pyproject.toml ./
 RUN pip install -r requirements-dev.txt
+COPY --from=compile /build/aiotrade/ ./aiotrade/
+COPY data/ ./data/
+COPY reports/ ./reports/
 COPY tests/ ./tests/
-RUN python -m pytest
+RUN test -z "$(find aiotrade -name '*.py')" && python -m pytest -p no:cacheprovider
 
-# Image d'exécution (cible par défaut)
-FROM base AS runtime
-RUN useradd --create-home --uid 10001 aiotrade \
-    && mkdir -p /data && chown aiotrade /data
+# --- Image d'exécution (cible par défaut) -----------------------------------
+FROM deps AS runtime
+COPY --from=compile /build/aiotrade/ ./aiotrade/
+COPY data/ ./data/
+COPY reports/ ./reports/
+RUN test -z "$(find /app -name '*.py')" \
+    && useradd --create-home --uid 10001 aiotrade \
+    && mkdir -p /data/metrics /data/ledger \
+    && touch /data/metrics/.volume /data/ledger/.volume \
+    && chown -R aiotrade /data
 USER aiotrade
+ENV AIOTRADE_METRICS_DIR=/data/metrics
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=4s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)" || exit 1

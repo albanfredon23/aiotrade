@@ -1,51 +1,67 @@
-# AIOTrade : démarrage complet en une commande
-#   docker compose up --build
-# puis ouvrir http://localhost:8088 (port modifiable via AIOTRADE_PORT).
+# AIOTrade : deux services cloisonnés, démarrage en une commande
+#   docker compose up --build        puis http://localhost
+#
+#   aiotrade-engine  moteur Python (bytecode seul), aucun port publié, réseau interne
+#                    uniquement ; écrit ses métriques dans le volume « metrics ».
+#   aiotrade-web     site et tableau de bord, seul service exposé (80 / 443) ; lit
+#                    les métriques en lecture seule et relaie /api vers le moteur.
 #
 # Exécutant de trading (désactivé par défaut, profil « trading ») :
-#   docker compose --profile trading up -d trader
-# Mode papier par défaut (données publiques Binance, aucun ordre). Voir .env.example
-# pour le testnet ; le live exige un double verrou explicite (README).
+#   docker compose --profile trading up -d aiotrade-trader
+# Mode papier par défaut. Il est seul à avoir un accès sortant (réseau egress-net),
+# nécessaire pour joindre le courtier ; le moteur de l'API n'en a jamais.
 name: aiotrade
 
 services:
-  engine:
+  aiotrade-engine:
     build:
       context: ./engine
       target: runtime
     restart: unless-stopped
+    networks: [internal-net]
+    # Aucun « ports » ni « expose » vers l'hôte : joignable seulement depuis internal-net.
+    environment:
+      AIOTRADE_METRICS_DIR: /data/metrics
+    volumes:
+      - metrics:/data/metrics
     read_only: true
     tmpfs:
       - /tmp
+    cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    expose:
-      - "8000"
 
-  web:
+  aiotrade-web:
     build: ./web
     restart: unless-stopped
     depends_on:
-      engine:
+      aiotrade-engine:
         condition: service_healthy
+    networks: [internal-net, public-net]
+    ports:
+      - "${AIOTRADE_HTTP_PORT:-80}:8080"
+      - "${AIOTRADE_HTTPS_PORT:-443}:8443"
+    volumes:
+      - metrics:/srv/metrics:ro
+      - ${AIOTRADE_CERTS_DIR:-./certs}:/etc/nginx/certs:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+      - /etc/nginx/aiotrade
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]  # nginx : processus maître root, workers non privilégiés
     security_opt:
       - no-new-privileges:true
-    ports:
-      - "${AIOTRADE_PORT:-8088}:8080"
 
-  trader:
+  aiotrade-trader:
     profiles: ["trading"]
     build:
       context: ./engine
       target: runtime
     restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      disable: true
+    networks: [egress-net]
     command:
       - python
       - -m
@@ -56,10 +72,11 @@ services:
       - --symbol
       - ${AIOTRADE_SYMBOL:-BTCUSDT}
       - --ledger
-      - /data/decisions.jsonl
+      - /data/ledger/decisions.jsonl
       - --loop
     environment:
-      # Les clés restent dans votre fichier .env local (jamais versionné) ou dans votre gestionnaire de secrets.
+      AIOTRADE_METRICS_DIR: /data/metrics
+      # Les clés restent dans votre fichier .env local (jamais versionné) ou votre gestionnaire de secrets.
       AIOTRADE_BINANCE_ENV: ${AIOTRADE_BINANCE_ENV:-testnet}
       AIOTRADE_BINANCE_API_KEY: ${AIOTRADE_BINANCE_API_KEY:-}
       AIOTRADE_BINANCE_API_SECRET: ${AIOTRADE_BINANCE_API_SECRET:-}
@@ -69,7 +86,23 @@ services:
       AIOTRADE_BINANCE_LIVE_API_KEY: ${AIOTRADE_BINANCE_LIVE_API_KEY:-}
       AIOTRADE_BINANCE_LIVE_API_SECRET: ${AIOTRADE_BINANCE_LIVE_API_SECRET:-}
     volumes:
-      - trader-ledger:/data
+      - metrics:/data/metrics
+      - trader-ledger:/data/ledger
+    healthcheck:
+      disable: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal-net:
+    internal: true  # aucun accès sortant, aucun port publiable
+  public-net: {}
+  egress-net: {}
 
 volumes:
+  metrics:
   trader-ledger:

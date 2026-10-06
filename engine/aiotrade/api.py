@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
@@ -21,12 +22,43 @@ from .integrity import IntegrityConfig
 from .ledger import verify_chain
 from .macro_gate import MacroGateConfig
 from .market import MarketConfig, Shock, generate_market, iso_utc
+from .metrics import MetricsPublisher, now_utc, write_json_atomic
 from .scg import RiskMandate
 from .sizing import SizingConfig
 
 REPORT_PATH = Path(__file__).resolve().parent.parent / "reports" / "benchmark.json"
 DEMO_CALIBRATION_BARS = 12 * 21 * 96  # 12 mois de calibration, comme le protocole
 DEMO_TEST_BARS = 480  # 5 jours ouvrés en barres de 15 min
+
+_metrics = MetricsPublisher("engine", directory=None)
+
+
+def _benchmark_summary() -> dict[str, Any] | None:
+    if not REPORT_PATH.exists():
+        return None
+    report = json.loads(REPORT_PATH.read_text(encoding="utf-8"))
+    return {"targets": report.get("targets"), "scg": {k: report.get("scg", {}).get(k) for k in ("scg_pruning_rate",)}}
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Au démarrage : publie l'état du moteur dans le volume de métriques (s'il est configuré)."""
+    global _metrics
+    _metrics = MetricsPublisher("engine")
+    if _metrics.enabled:
+        if REPORT_PATH.exists() and _metrics.directory is not None:
+            try:
+                write_json_atomic(_metrics.directory / "benchmark.json", json.loads(REPORT_PATH.read_text(encoding="utf-8")))
+            except OSError:
+                pass
+        _metrics.update(
+            service="aiotrade-engine", version=__version__, status="ok", mode="simulation",
+            started_at=now_utc(), simulations_served=0, last_simulation=None, benchmark=_benchmark_summary(),
+        )
+    yield
+    if _metrics.enabled:
+        _metrics.update(status="stopped")
+
 
 app = FastAPI(
     title="AIOTrade API",
@@ -37,6 +69,7 @@ app = FastAPI(
     ),
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 
@@ -210,7 +243,22 @@ def config() -> dict:
 @app.post("/api/simulate")
 def simulate(body: SimulationIn, request: Request) -> dict:
     _rate_limit(request, "simulate", 30, 60)
-    return _simulation(body.seed, body.shock.value, body.mandate.model_dump_json())
+    started = time.perf_counter()
+    result = _simulation(body.seed, body.shock.value, body.mandate.model_dump_json())
+    if _metrics.enabled:
+        served = int(_metrics.snapshot().get("simulations_served") or 0) + 1
+        _metrics.update(
+            simulations_served=served,
+            last_simulation={
+                "at": now_utc(),
+                "seed": body.seed,
+                "shock": body.shock.value,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "decisions": result["ledger"]["breakdown"],
+                "ledger_verified": result["ledger"]["verified"],
+            },
+        )
+    return result
 
 
 @app.post("/api/scg/check")
