@@ -59,7 +59,9 @@ jobs:
           # Aucune source Python dans l'image du moteur, seulement du bytecode
           test "$(docker compose exec -T aiotrade-engine sh -c 'find /app -name "*.py" | wc -l')" = "0"
           # Aucun port du moteur publié sur l'hôte
-          test "$(docker compose port aiotrade-engine 8000)" = ":0"
+          # (selon la version de Compose : sortie « :0 » ou erreur « no port » ; jamais un vrai port)
+          if docker compose port aiotrade-engine 8000 2>/dev/null | grep -q ':[1-9]'; then exit 1; fi
+          test -z "$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}}{{end}}{{end}}' "$(docker compose ps -q aiotrade-engine)")"
           # Aucun accès sortant depuis le moteur (réseau internal-net)
           if docker compose exec -T aiotrade-engine python -c "import urllib.request; urllib.request.urlopen('https://github.com', timeout=5)"; then exit 1; fi
           # Volume de métriques en lecture seule côté site
