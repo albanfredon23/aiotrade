@@ -99,7 +99,7 @@ function buildBanner() {
       <p id="consent-desc">
         Ce site n'utilise aucun cookie publicitaire. Avec votre accord, nous mesurons l'audience de façon anonymisée
         pour améliorer le site. Vous pouvez accepter, refuser ou personnaliser, et changer d'avis à tout moment via
-        « Gérer mes cookies ». <a href="/cookies.html">En savoir plus</a>
+        « Gérer mes cookies ». <a href="cookies.html">En savoir plus</a>
       </p>
       <form class="consent-prefs" hidden>
         <fieldset>
